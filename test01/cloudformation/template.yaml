@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ServiceFlow CloudFormation Stack: Standardized microservice provisioning template'
+
+Parameters:
+  AwsRegion:
+    Type: String
+    Description: Target AWS Region
+    Default: us-east-1
+  ServiceName:
+    Type: String
+    Description: Microservice name identifier
+    Default: 'test01'
+  Environment:
+    Type: String
+    Description: Deployment environment
+    Default: 'dev'
+  TaskCpu:
+    Type: Number
+    Description: ECS Task CPU sizing units
+    Default: 256
+  TaskMemory:
+    Type: Number
+    Description: ECS Task Memory sizing units (MB)
+    Default: 512
+  DesiredCount:
+    Type: Number
+    Description: Active Fargate container counts
+    Default: 1
+  ApiGatewayId:
+    Type: String
+    Description: Unified platform API Gateway ID
+    Default: '09nfp64myk'
+  VpcLinkId:
+    Type: String
+    Description: Platform API Gateway VPC Link ID for secure private routing
+    Default: 'xw0d3e'
+  VpcId:
+    Type: String
+    Description: Base VPC Identifier
+    Default: 'vpc-0ff4739b3ec847c17'
+  VpcCidr:
+    Type: String
+    Description: VPC CIDR block for internal security group ingress rules
+    Default: '10.10.0.0/22'
+  PrivateSubnetA:
+    Type: String
+    Description: Private Subnet A Identifier
+    Default: 'subnet-0b807afcd6a00b1a6'
+  PrivateSubnetB:
+    Type: String
+    Description: Private Subnet B Identifier
+    Default: 'subnet-06ff006602438a609'
+  CloudMapNamespaceId:
+    Type: String
+    Description: Platform Cloud Map Private DNS Namespace ID
+    Default: 'ns-qu6djav5bg5wytoq'
+
+Resources:
+  # 1. Security Groups (VPC Privilege Isolation)
+  ECSsg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for ECS Fargate Tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: Allow HTTP ingress from internal VPC traffic (API Gateway VPC Link)
+          IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: !Ref VpcCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServiceName}-ecs-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # 2. Cloud Map Service Discovery Registration
+  DiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: !Ref ServiceName
+      NamespaceId: !Ref CloudMapNamespaceId
+      DnsConfig:
+        DnsRecords:
+          - Type: SRV
+            TTL: 10
+        RoutingPolicy: MULTIVALUE
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  # 3. ECS Cluster, Task Definition, and IAM execution roles
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ServiceName}-${Environment}-cluster'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ServiceName}-${Environment}-ecs-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ecs-tasks.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ServiceName}-${Environment}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ecs-tasks.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      ManagedPolicyArns:
+        - !Ref CWLogsPolicy
+
+  CWLogsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ServiceName}-${Environment}-cw-logs-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: '*'
+
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ServiceName}-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ServiceName}-${Environment}-task'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ECSExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Ref ServiceName
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ServiceName}:latest'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              HostPort: 8080
+          Environment:
+            - Name: PORT
+              Value: '8080'
+            - Name: ENVIRONMENT
+              Value: !Ref Environment
+            - Name: SERVICE_NAME
+              Value: !Ref ServiceName
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: !Ref ServiceName
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # 4. API Gateway Integrations & Dynamic Custom Route Mapping
+  APIGatewayIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGatewayId
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLinkId
+      IntegrationUri: !GetAtt DiscoveryService.Arn
+      PayloadFormatVersion: '1.0'
+      RequestParameters:
+        overwrite:path: $request.path.proxy
+
+  APIGatewayRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGatewayId
+      RouteKey: !Sub 'ANY /${ServiceName}/{proxy+}'
+      Target: !Sub 'integrations/${APIGatewayIntegration}'
+
+  APIGatewayRouteRoot:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGatewayId
+      RouteKey: !Sub 'ANY /${ServiceName}'
+      Target: !Sub 'integrations/${APIGatewayIntegration}'
+
+  # 5. ECS Fargate Service (Securely isolated in Private Subnets)
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub '${ServiceName}-${Environment}-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref ECSsg
+          Subnets:
+            - !Ref PrivateSubnetA
+            - !Ref PrivateSubnetB
+          AssignPublicIp: DISABLED
+      ServiceRegistries:
+        - RegistryArn: !GetAtt DiscoveryService.Arn
+          ContainerName: !Ref ServiceName
+          ContainerPort: 8080
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # 6. SRE Observability: Metric Alarms
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ServiceName}-${Environment}-high-cpu-alarm'
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 2
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Period: 60
+      Statistic: Average
+      Threshold: 80
+      AlarmDescription: Alert when task CPU utilization exceeds 80%
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+        - Name: ServiceName
+          Value: !Sub '${ServiceName}-${Environment}-service'
+
+Outputs:
+  ServiceEndpoint:
+    Description: Public service endpoint URL mapped through API Gateway
+    Value: !Sub 'https://${ApiGatewayId}.execute-api.${AWS::Region}.amazonaws.com/${ServiceName}'
+  EcrRepositoryUrl:
+    Description: ECR Repository URL for container image push
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ServiceName}'
