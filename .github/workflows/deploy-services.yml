@@ -1,0 +1,56 @@
+name: ServiceFlow Central Monorepo Deployment
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '**'
+
+jobs:
+  deploy-changed-services:
+    name: Deploy Changed SRE Services
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Detect and Deploy Changed Services
+        run: |
+          # Get list of changed directories in the last commit
+          CHANGED_DIRS=$(git diff --name-only HEAD^ HEAD | grep '/' | cut -d'/' -f1 | uniq)
+          for SERVICE in $CHANGED_DIRS; do
+            if [ -d "$SERVICE" ] && [ -f "$SERVICE/cloudformation/template.yaml" ]; then
+              echo "Detected changes in SRE service: $SERVICE. Initiating rollout..."
+              
+              REPO_NAME="${SERVICE}-dev-repo"
+              aws ecr describe-repositories --repository-names "$REPO_NAME" || \
+              aws ecr create-repository --repository-name "$REPO_NAME" --image-scanning-configuration scanOnPush=true
+              
+              id_ecr=$(aws sts get-caller-identity --query Account --output text)
+              aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin $id_ecr.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+              
+              docker build -t $id_ecr.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/$REPO_NAME:latest -f $SERVICE/app/Dockerfile $SERVICE/app
+              docker push $id_ecr.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/$REPO_NAME:latest
+              
+              STACK_NAME="${SERVICE}-dev-stack"
+              STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NOT_FOUND")
+              if [ "$STATUS" = "ROLLBACK_COMPLETE" ]; then
+                aws cloudformation delete-stack --stack-name "$STACK_NAME"
+                aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+              fi
+              
+              aws cloudformation deploy \
+                --template-file $SERVICE/cloudformation/template.yaml \
+                --stack-name "$STACK_NAME" \
+                --capabilities CAPABILITY_NAMED_IAM
+            fi
+          done
